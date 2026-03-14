@@ -1,0 +1,3 @@
+useDynLib(twocompiv, .registration=TRUE)
+importFrom(Rcpp, evalCpp)
+export(Cpp_twocomp_iv)

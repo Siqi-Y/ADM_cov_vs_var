@@ -1,24 +1,85 @@
 # Meropenem in CRRT patients
 # two-compartment model with linear elimination (iv)
+# C++ analytical solution (no rxode2 dependency)
 
 ## ----- Loading library ----
 library(pacman)
-pacman::p_load(admr, rxode2, tidyverse, MASS, data.table, pracma,
+pacman::p_load(admr, Rcpp, tidyverse, MASS, data.table, pracma,
                writexl, scales, future, future.apply, progressr, parallel)
 
 # Enable progress handlers globally
 handlers(global = TRUE)
 handlers("progress")
 
-# Sets up parallel processing
+# Sets up parallel processing — cap at 8 workers to avoid memory/compilation issues
 n_workers <- min(parallel::detectCores() - 1, 40)
 plan(multisession, workers = n_workers)
 
+## ----- Build & install C++ as a package ----
+pkg_dir <- file.path(getwd(), "twocompiv")
+# Only build if not already installed
+if (!requireNamespace("twocompiv", quietly = TRUE)) {
+  # Create package skeleton
+  if (dir.exists(pkg_dir)) unlink(pkg_dir, recursive = TRUE)
+  Rcpp::Rcpp.package.skeleton(
+    name = "twocompiv",
+    path = getwd(),
+    cpp_files = character(0),
+    example_code = FALSE
+  )
+  # Write the C++ source
+  writeLines('
+#include <Rcpp.h>
+#include <cmath>
+using namespace Rcpp;
+// [[Rcpp::export]]
+NumericMatrix Cpp_twocomp_iv(NumericVector cl, NumericVector v1,
+                             NumericVector v2, NumericVector q,
+                             NumericVector ti) {
+  int n_ind  = cl.size();
+  int n_time = ti.size();
+  NumericMatrix out(n_ind, n_time);
+  for (int iter = 0; iter < n_ind; ++iter) {
+    double k   = cl[iter] / v1[iter];
+    double k12 = q[iter]  / v1[iter];
+    double k21 = q[iter]  / v2[iter];
+    double sum_rates = k + k12 + k21;
+    double sqrt_disc = sqrt(sum_rates * sum_rates - 4.0 * k * k21);
+    double alpha = 0.5 * (sum_rates + sqrt_disc);
+    double beta  = 0.5 * (sum_rates - sqrt_disc);
+    double A = (alpha - k21) / (alpha - beta) / v1[iter];
+    double B = (k21 - beta)  / (alpha - beta) / v1[iter];
+    for (int i = 0; i < n_time; ++i) {
+      out(iter, i) = A * exp(-alpha * ti[i]) + B * exp(-beta * ti[i]);
+    }
+  }
+  return out;
+}
+', file.path(pkg_dir, "src", "twocomp_iv.cpp"))
+  # Clean up auto-generated files
+  unlink(file.path(pkg_dir, "src", "rcpp_hello_world.cpp"), force = TRUE)
+  unlink(file.path(pkg_dir, "src", "*.o"), force = TRUE)
+  unlink(file.path(pkg_dir, "src", "*.so"), force = TRUE)
+  unlink(file.path(pkg_dir, "man"), recursive = TRUE, force = TRUE)
+  dir.create(file.path(pkg_dir, "man"), showWarnings = FALSE)
+  # Generate Rcpp bindings (creates RcppExports.cpp and RcppExports.R)
+  Rcpp::compileAttributes(pkg_dir)
+  # Write NAMESPACE with explicit export
+  writeLines(c(
+    'useDynLib(twocompiv, .registration=TRUE)',
+    'importFrom(Rcpp, evalCpp)',
+    'export(Cpp_twocomp_iv)'
+  ), file.path(pkg_dir, "NAMESPACE"))
+  # Install the package
+  install.packages(pkg_dir, repos = NULL, type = "source")
+}
+library(twocompiv)
+
 ## ----- Define Simulation Conditions ----
 
-n_subjects  <- c(20, 40, 75, 100, 250, 500, 1000, 10000)
+n_subjects   <- c(20, 40, 75, 100, 250, 500, 750, 1000, 2500, 10000)
 n_timepoints <- 12
-n_reps       <- 25
+n_reps       <- 50
 
 get_timepoints <- function(n) {
   switch(as.character(n),
@@ -35,38 +96,44 @@ times <- get_timepoints(n_timepoints)
 ## ----- Define Global True Parameters  ----
 
 TRUE_PARAMS <- list(
-  theta    = c(cl = 3.03, v1 = 14.2, v2 = 14.6, q = 15.9),
-  iiv_sd   = c(cl = 0.52, v1 = 0.33, v2 = 0.33, q = 0.26),
+  theta      = c(cl = 3.03, v1 = 14.2, v2 = 14.6, q = 15.9),
+  iiv_sd     = c(cl = 0.52, v1 = 0.33, v2 = 0.33, q = 0.26),
   Sigma_prop = 0.153,
-  dose     = 1000
+  dose       = 1000
 )
 
 TRUE_OMEGA <- diag(TRUE_PARAMS$iiv_sd^2)
 
-# Compile Model
-rxModel <- function(){
-  model({
-    cp = linCmt(cl, v1, v2, q)
-  })
+## ----- Prediction wrapper ----
+
+# Wrapper matching admr predder interface: returns matrix [n_ind x n_time]
+pk_predder <- function(time, theta_i, dose = TRUE_PARAMS$dose) {
+  theta_i <- as.matrix(theta_i)
+  n_ind   <- nrow(theta_i)
+  if (n_ind == 0) {
+    theta_i <- matrix(theta_i, nrow = 1)
+    n_ind   <- 1
+  }
+  doses <- rep(dose, n_ind)
+  pred  <- twocompiv::Cpp_twocomp_iv(theta_i[, 1], theta_i[, 2],
+                                     theta_i[, 3], theta_i[, 4], time)
+  pred * doses
 }
-rxModel <- rxode2(rxModel)
-rxModel <- rxModel$simulationModel
 
-# Pre-create PK evaluation event table
-pk_ev <- et() %>%
-  et(amt = TRUE_PARAMS$dose, time = 0) %>%
-  add.sampling(seq(0, 12, 0.01))
+## ----- Compute TRUE_VALS using C++ ----
 
-# Initial calculation for TRUE_VALS
-TRUE_PK <- rxSolve(rxModel, TRUE_PARAMS$theta, pk_ev)
+fine_times <- seq(0.001, 12, 0.01)
+true_pk    <- as.numeric(
+  pk_predder(fine_times, matrix(TRUE_PARAMS$theta, nrow = 1))
+)
 
-omega_names    <- c("omega_cl", "omega_v1", "omega_v2", "omega_q")
+omega_names     <- c("omega_cl", "omega_v1", "omega_v2", "omega_q")
 TRUE_OMEGA_DIAG <- setNames(diag(TRUE_OMEGA), omega_names)
 
 TRUE_VALS <- c(
   TRUE_PARAMS$theta,
-  auc            = trapz(TRUE_PK$time, TRUE_PK$cp),
-  cmax           = max(TRUE_PK$cp),
+  auc            = trapz(fine_times, true_pk),
+  cmax           = max(true_pk),
   residual_error = TRUE_PARAMS$Sigma_prop^2,
   TRUE_OMEGA_DIAG
 )
@@ -78,32 +145,17 @@ extract_results <- function(fit, true_vals) {
   tryCatch({
     tp <- fit$transformed_params
 
-    # PK parameters from beta
     pk_params <- c("cl", "v1", "v2", "q")
     est_beta  <- tp$beta[pk_params]
 
-    #AUC and Cmax from estimated beta
-    # local_model <- function(){
-    #   model({ cp = linCmt(cl, v1, v2, q) })
-    # }
-    # local_model <- rxode2(local_model)
-    # local_model <- local_model$simulationModel
+    # AUC and Cmax from estimated beta using C++
+    out_fine <- as.numeric(
+      pk_predder(fine_times, matrix(est_beta, nrow = 1))
+    )
+    auc  <- trapz(fine_times, out_fine)
+    cmax <- max(out_fine)
 
-    local_model <- rxModel
-
-    local_ev <- et() %>%
-      et(amt = TRUE_PARAMS$dose, time = 0) %>%
-      add.sampling(seq(0, 12, 0.01))
-
-    out  <- rxSolve(local_model, params = est_beta, events = local_ev,
-                    inits = c(central = 0, peripheral = 0))
-    auc  <- trapz(out$time, out$cp)
-    cmax <- max(out$cp)
-
-    # Residual error (Sigma_prop is already on variance scale)
-    re_est <- as.numeric(tp$Sigma_prop)
-
-    # Omega diagonal variances (first 4 params = cl, v1, v2, q)
+    re_est     <- as.numeric(tp$Sigma_prop)
     omega_diag <- setNames(diag(tp$Omega)[1:4], omega_names)
 
     res_vec <- c(est_beta, auc = auc, cmax = cmax,
@@ -127,21 +179,15 @@ run_single_iteration <- function(n_sub, i) {
       q  = TRUE_PARAMS$theta['q']  * exp(mv[, 4])
     )
 
-    ev <- et() %>%
-      et(amt = TRUE_PARAMS$dose, time = 0) %>%
-      et(time = times) %>%
-      et(ID = 1:n_sub)
+    # Simulate individual concentrations using C++
+    theta_mat <- as.matrix(params_all[, .(cl, v1, v2, q)])
+    sim_mat   <- pk_predder(times, theta_mat)  # [n_sub x n_time]
 
-    sim <- rxSolve(rxModel, params_all, ev, cores = 0) %>%
-      as.data.frame() %>%
-      dplyr::filter(time > 0) %>%
-      dplyr::mutate(DV = pmax(cp, 0.01))
+    # Apply floor and use as DV
+    sim_mat <- pmax(sim_mat, 0.01)
 
-    ind_wide <- sim %>%
-      dplyr::select(id, time, DV) %>%
-      tidyr::pivot_wider(names_from = time, values_from = DV) %>%
-      dplyr::select(-id) %>%
-      as.matrix()
+    # sim_mat is already [n_sub x n_time] — use directly as ind_wide
+    ind_wide <- sim_mat
 
     agg_full <- admr::meancov(ind_wide)
     diag(agg_full$V) <- diag(agg_full$V) + (TRUE_PARAMS$Sigma_prop^2) * (agg_full$E^2)
@@ -151,16 +197,14 @@ run_single_iteration <- function(n_sub, i) {
 
     ## ----- Fitting model -----
     predder <- function(time, theta_i) {
-      n_ind <- nrow(theta_i)
-      if (is.null(n_ind) || n_ind == 0) {
-        theta_i <- as.data.frame(t(theta_i))
-        n_ind <- 1
+      theta_i <- as.matrix(theta_i)
+      n_ind   <- nrow(theta_i)
+      if (n_ind == 0) {
+        theta_i <- matrix(theta_i, nrow = 1)
+        n_ind   <- 1
       }
-      ev <- eventTable(amount.units = "mg", time.units = "hours")
-      ev$add.dosing(dose = TRUE_PARAMS$dose, start.time = 0)
-      ev$add.sampling(time)
-      out <- rxSolve(rxModel, theta_i, ev, cores = 0)
-      matrix(out$cp, nrow = n_ind, ncol = length(time), byrow = TRUE)
+      twocompiv::Cpp_twocomp_iv(theta_i[, 1], theta_i[, 2],
+                                theta_i[, 3], theta_i[, 4], time) * TRUE_PARAMS$dose
     }
 
     base_opts <- list(
